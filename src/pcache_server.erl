@@ -55,9 +55,11 @@ locate(DatumKey, #cache{datum_index = DatumIndex, data_module = DataModule,
   Key = key(DatumKey),
   case ets:lookup(DatumIndex, Key) of 
     [{Key, Pid}] -> {found, Pid};
-    []           -> Pid = launch_datum(DatumKey, DatumIndex, DataModule,
-                                       DataAccessor, DefaultTTL, Policy),
-                    {launched, Pid};
+    []           -> case launch_datum(DatumKey, DatumIndex, DataModule,
+                                      DataAccessor, DefaultTTL, Policy) of
+                      Pid when is_pid(Pid) -> {launched, Pid};
+                      Other -> {failed, Other}
+                    end;
     Other        -> {failed, Other}
   end.
 
@@ -85,7 +87,7 @@ handle_call({generic_get, M, F, Key}, _From, #cache{datum_index = DatumIndex,
 %    io:format("Requesting: ~p:~p(~p)~n", [M, F, Key]),
   Reply = 
   case locate_memoize(Key, DatumIndex, M, F, DefaultTTL, Policy) of
-    {failed, Other} -> {failed, Other};
+    {failed, Other} -> Other;
       {_, DatumPid} -> case get_data(DatumPid) of
                          {ok, Data} -> Data;
                          {no_data, timeout} -> no_data
@@ -97,7 +99,7 @@ handle_call({get, Key}, _From, #cache{datum_index = _DatumIndex} = State) ->
 %    io:format("Requesting: (~p)~n", [Key]),
   Reply = 
   case locate(Key, State) of
-    {failed, Other} -> {failed, Other};
+    {failed, Other} -> Other;
       {_, DatumPid} -> case get_data(DatumPid) of
                          {ok, Data} -> Data;
                          {no_data, timeout} -> no_data
@@ -269,13 +271,19 @@ create_datum(Key, Data, TTL, Type) ->
   #datum{key = Key, mgr = self(), data = Data, started = os:timestamp(),
          ttl = TTL, remaining_ttl = TTL, type = Type}.
 
+-compile({inline, [{datum_error, 2}]}).
+datum_error(How, What) -> {pcache_datum_error, {How, What}}.
+
 launch_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
-  CacheData = Module:Accessor(Key),
-  UseKey = key(Key),
-  Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
-  {Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_loop, [Datum]),
-  ets:insert(EtsIndex, {UseKey, Pid}),
-  Pid.
+  try Module:Accessor(Key) of
+    CacheData -> UseKey = key(Key),
+                 Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
+                 {Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_loop, [Datum]),
+                 ets:insert(EtsIndex, {UseKey, Pid}),
+                 Pid
+  catch
+    How:What -> datum_error({How, What}, erlang:get_stacktrace())
+  end.
 
 launch_memoize_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
   CacheData = Module:Accessor(Key),
